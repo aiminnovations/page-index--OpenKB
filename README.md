@@ -265,21 +265,7 @@ Long-document retrieval is a [known challenge](https://x.com/karpathy/status/203
 
 PageIndex runs locally by default using the [open-source version](https://github.com/VectifyAI/PageIndex), with no external dependencies required.
 
-***Cloud Support*** *(Optional)*:
-
-For large or complex PDFs, [PageIndex Cloud](https://docs.pageindex.ai/) can be used to access additional capabilities, including:
-
-- OCR support for scanned PDFs (via hosted VLM models)
-- Faster structure generation
-- Scalable indexing for large documents
-
-Set `PAGEINDEX_API_KEY` in your `.env` to enable cloud features:
-
-```
-PAGEINDEX_API_KEY=your_pageindex_api_key
-```
-
-→ **Example:** local vs. cloud indexing, and importing a cloud-indexed doc — [`examples/pageindex-cloud/`](examples/pageindex-cloud/).
+***Prepared documents***: a tree and page text indexed elsewhere (e.g. by PageIndex Cloud, or by a host application) can be imported directly with `openkb.cli.import_prepared(kb_dir, key, name, tree, pages, description)` — the same summary, source and concept pages as `openkb add`, with per-call LLM credentials (`bundle=`) instead of process-wide keys.
 
 ### AGENTS.md
 

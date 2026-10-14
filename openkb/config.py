@@ -408,6 +408,9 @@ class LlmCredentialBundle:
     timeout: float | None = None
     parallel_tool_calls: bool | None = None
     parallel_tool_calls_explicit: bool = False
+    # A default completion cap for providers that require one (Anthropic, e.g.
+    # behind an OpenAI-compatible gateway); a call's own max_tokens wins.
+    max_tokens: int | None = None
 
 
 def resolve_credential_bundle(kb_dir: Path) -> LlmCredentialBundle:

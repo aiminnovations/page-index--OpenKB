@@ -618,6 +618,7 @@ def test_snapshot_add_paths_excludes_blob_store(tmp_path):
     from openkb.cli import _snapshot_add_paths
 
     paths = _snapshot_add_paths(tmp_path, "doc", None, None)
-    assert (tmp_path / ".openkb" / "files") not in paths
-    # hashes.json / pageindex.db are still snapshotted eagerly.
+    assert (tmp_path / ".openkb" / "docs") not in paths
+    # hashes.json / PageIndex's manifest.json are still snapshotted eagerly.
     assert (tmp_path / ".openkb" / "hashes.json") in paths
+    assert (tmp_path / ".openkb" / "manifest.json") in paths

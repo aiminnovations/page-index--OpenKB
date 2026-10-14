@@ -13,7 +13,6 @@ plus the **real artifact** OpenKB produced for it (generated, not hand-written).
 | --- | --- | --- |
 | [`configuration/`](configuration/) | `init`, `config.yaml`, API keys, LiteLLM tuning (Ollama, Copilot) | — |
 | [`commands/`](commands/) | the everyday loop: `add` · `query` · `remove` · `recompile` · `lint` · `list` · `status` | a compiled [`sample-wiki/`](commands/sample-wiki/) |
-| [`pageindex-cloud/`](pageindex-cloud/) | long documents: local vs. cloud indexing, and importing cloud-indexed docs | — |
 | [`chat/`](chat/) | the interactive REPL: persistent sessions + slash commands | — |
 | [`skills/`](skills/) | distill a redistributable agent skill from your wiki | [`transformer-attention/SKILL.md`](skills/transformer-attention/SKILL.md) |
 | [`slides/`](slides/) | generate a single-file HTML slide deck | [`attention-intro.html`](slides/attention-intro.html) |

@@ -574,3 +574,20 @@ class TestSetupLlmKey:
 
         _setup_llm_key(tmp_path)
         assert "No LLM API key found" not in capsys.readouterr().out
+
+
+def test_initialize_kb_inherit_env_false_keeps_cwd_secrets_out(tmp_path, monkeypatch):
+    """A host passing credentials per call must be able to create a KB without
+    copying its working directory's .env (and its keys) into the KB."""
+    from openkb.cli import initialize_kb
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-secret\n", encoding="utf-8")
+    monkeypatch.setattr("openkb.cli.register_kb", lambda _p: None)
+
+    initialize_kb(tmp_path / "kb", model="openai/m", inherit_env=False)
+
+    env = (tmp_path / "kb" / ".env").read_text(encoding="utf-8")
+    assert "sk-secret" not in env
+    assert (tmp_path / "kb" / ".openkb" / "hashes.json").exists()

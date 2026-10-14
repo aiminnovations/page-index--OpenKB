@@ -69,11 +69,7 @@ from openkb.converter import (
     convert_document,
     resolve_doc_name_from_key,
 )
-from openkb.indexer import (
-    _cloud_display_stem,
-    _write_long_doc_artifacts,
-    prepare_cloud_import,
-)
+from openkb.indexer import _normalize_page_content, _write_long_doc_artifacts
 from openkb.locks import atomic_write_json, atomic_write_text, kb_ingest_lock, kb_read_lock
 from openkb.log import append_log
 from openkb.mutation import publish_staged_tree
@@ -243,14 +239,16 @@ SUPPORTED_EXTENSIONS = {
 # Map raw doc types to display types
 _TYPE_DISPLAY_MAP = {
     "long_pdf": "pageindex",
+    "pageindex_prepared": "pageindex",
     "pageindex_cloud": "pageindex",
 }
 
 # Registry types that were compiled via the long-doc pipeline (tree + per-page
-# JSON source), as opposed to short docs (markdown source). Both the local
-# long-PDF type and cloud imports belong here — they share the long-doc
-# summary/source layout and recompile path.
-_LONG_DOC_TYPES = {"long_pdf", "pageindex_cloud"}
+# JSON source), as opposed to short docs (markdown source). The local long-PDF
+# type and prepared imports (``import_prepared``) belong here — they share the
+# long-doc summary/source layout and recompile path. ``pageindex_cloud`` is
+# kept only so entries written by the removed cloud import still read.
+_LONG_DOC_TYPES = {"long_pdf", "pageindex_prepared", "pageindex_cloud"}
 
 
 def _is_long_doc(meta: dict) -> bool:
@@ -401,18 +399,16 @@ def _snapshot_add_paths(
     final_raw: Path | None,
     final_source: Path | None,
 ) -> list[Path]:
-    # NOTE: .openkb/files (the PageIndex blob store) is intentionally NOT
+    # NOTE: .openkb/docs (PageIndex's per-document store) is intentionally NOT
     # snapshotted here. It is append-only by {doc_id}, and the doc_id is only
     # assigned during indexing (after this snapshot). Eagerly snapshotting the
-    # whole tree cost one os.link per existing blob on every add; instead the
-    # long-doc add path registers just the new blob via snapshot.track_new()
-    # once indexing has run.
+    # whole tree cost one os.link per existing document on every add; instead
+    # the long-doc add path registers just the new document via
+    # snapshot.track_new() once indexing has run. The manifest that lists the
+    # documents is snapshotted, so a rollback forgets the new one.
     paths = [
         kb_dir / ".openkb" / "hashes.json",
-        kb_dir / ".openkb" / "pageindex.db",
-        kb_dir / ".openkb" / "pageindex.db-wal",
-        kb_dir / ".openkb" / "pageindex.db-shm",
-        kb_dir / ".openkb" / "pageindex.db-journal",
+        kb_dir / ".openkb" / "manifest.json",
         kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
         kb_dir / "wiki" / "sources" / f"{doc_name}.json",
         kb_dir / "wiki" / "sources" / "images" / doc_name,
@@ -516,14 +512,11 @@ def _add_single_file_locked(
             if result.raw_path is None:
                 raise RuntimeError(f"Converted long document has no raw artifact: {file_path.name}")
             click.echo("  Long document detected — indexing with PageIndex...")
-            # PageIndex content-dedups: if the same content is already indexed
-            # (e.g. hashes.json and pageindex.db diverged after a remove whose
-            # PageIndex cleanup failed), col.add() returns the EXISTING doc_id
-            # and writes no new blob. Capture the blob set *before* indexing so
-            # we register only blobs THIS add actually created — otherwise
-            # rollback would delete a prior document's blob.
-            files_root = kb_dir / ".openkb" / "files"
-            blobs_before = set(files_root.glob("*/*")) if files_root.exists() else set()
+            # Capture PageIndex's document set *before* indexing so we register
+            # only the document THIS add created — otherwise rollback could
+            # delete a prior document.
+            docs_root = kb_dir / ".openkb" / "docs"
+            docs_before = set(docs_root.iterdir()) if docs_root.exists() else set()
             try:
                 from openkb.indexer import index_long_document
 
@@ -533,21 +526,15 @@ def _add_single_file_locked(
                 logger.debug("Indexing traceback:", exc_info=True)
                 raise
 
-            # Register only the newly-created blob artifacts for this doc (the
-            # {doc_id} file + its images dir) — the append-only store means the
-            # name isn't known until now — so rollback + crash recovery remove
-            # exactly this add's blob, never a pre-existing one, instead of
-            # snapshotting the whole store up front. The doc_id guard + the
-            # blobs_before diff keep a dedup hit (or an unexpected empty doc_id)
-            # from registering — and later deleting — existing blobs.
-            if index_result.doc_id and files_root.exists():
-                snapshot.track_new(
-                    [
-                        p
-                        for p in files_root.glob(f"*/{index_result.doc_id}*")
-                        if p not in blobs_before
-                    ]
-                )
+            # Register only the newly-created document directory for this doc —
+            # the append-only store means its name isn't known until now — so
+            # rollback + crash recovery remove exactly this add's document, never
+            # a pre-existing one. The doc_id guard + the docs_before diff keep an
+            # unexpected empty doc_id from registering — and later deleting —
+            # existing documents.
+            new_doc = docs_root / index_result.doc_id if index_result.doc_id else None
+            if new_doc is not None and new_doc.exists() and new_doc not in docs_before:
+                snapshot.track_new([new_doc])
 
             summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
             _run_compile_with_retry(
@@ -651,7 +638,7 @@ def _add_for_api(file_path: Path, kb_dir: Path, *, bundle=None) -> AddFileResult
     """Run the locked add pipeline and return a structured result for the API.
 
     Reuses the upstream ``add_single_file`` (which already holds the ingest
-    lock and handles cloud import / registry dedup) so the API and CLI share a
+    lock and handles registry dedup) so the API and CLI share a
     single ingest code path. Maps the ``Literal`` status to a message-bearing
     ``AddFileResult``; on ``skipped`` the caller (api._add_saved_file) deletes
     the freshly uploaded raw copy to avoid orphaning it.
@@ -671,134 +658,110 @@ def _add_for_api(file_path: Path, kb_dir: Path, *, bundle=None) -> AddFileResult
     )
 
 
-def _cleanup_failed_cloud_import(kb_dir: Path, doc_name: str) -> None:
-    """Best-effort wiki cleanup after a cloud import whose compilation failed.
+def import_prepared(
+    kb_dir: Path,
+    key: str,
+    name: str,
+    tree: dict | list,
+    pages: list,
+    description: str = "",
+    *,
+    model: str | None = None,
+    bundle=None,
+) -> Literal["added", "skipped", "failed"]:
+    """Import a long document that was already indexed elsewhere.
 
-    import_cloud_document writes the summary + per-page JSON source before
-    compile, and compile_long_doc writes concept/entity pages incrementally — so
-    a compile failure (which happens before the registry entry is added) would
-    otherwise strand wiki artifacts that ``openkb remove`` cannot reach. Mirror
-    remove's wiki cleanup (by doc_name, idempotent) but touch neither the
-    registry (no entry was added) nor PageIndex (the cloud doc is the user's).
-    """
-    from openkb.agent.compiler import (
-        remove_doc_from_concept_pages,
-        remove_doc_from_entity_pages,
-        remove_doc_from_index,
-    )
+    ``tree`` is a PageIndex tree — ``{"doc_name", "doc_description",
+    "structure"}`` or a bare ``structure`` list — and ``pages`` its per-page text
+    (``[{"page", "content"}]`` or any shape ``_normalize_page_content`` accepts).
+    ``key`` is the caller's stable identity for the document (re-importing the
+    same key is skipped); ``name`` is its display name. Writes the same long-doc
+    artifacts as ``add`` (summary + per-page JSON source), compiles concepts,
+    and registers a raw-less ``pageindex_prepared`` entry.
 
-    wiki_dir = kb_dir / "wiki"
-    (wiki_dir / "summaries" / f"{doc_name}.md").unlink(missing_ok=True)
-    (wiki_dir / "sources" / f"{doc_name}.json").unlink(missing_ok=True)
-    images_dir = wiki_dir / "sources" / "images" / doc_name
-    if images_dir.is_dir():
-        shutil.rmtree(images_dir, ignore_errors=True)
-    concept_result = remove_doc_from_concept_pages(wiki_dir, doc_name, keep_empty=False)
-    entity_result = remove_doc_from_entity_pages(wiki_dir, doc_name, keep_empty=False)
-    remove_doc_from_index(
-        wiki_dir,
-        doc_name,
-        concept_result["deleted"],
-        entity_slugs_deleted=entity_result["deleted"],
-    )
-
-
-def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> Literal["added", "skipped", "failed"]:
-    """Import an existing PageIndex Cloud document into the KB by ``doc_id``.
-
-    Fetches structure + page content from the cloud (no local PDF), compiles
-    concepts, and registers a raw-less ``pageindex_cloud`` entry. Idempotent:
-    re-importing the same ``doc_id`` is skipped. The user's cloud corpus is
-    never modified.
+    Nothing is set process-wide: pass ``bundle`` (a
+    ``config.LlmCredentialBundle``) to give the compile its own key, base URL
+    and headers, and ``model`` to override the KB's model.
     """
     import hashlib
     from openkb.state import HashRegistry
 
-    logger = logging.getLogger(__name__)
     openkb_dir = kb_dir / ".openkb"
     config = resolve_effective_config(kb_dir)[0]
-    _setup_llm_key(kb_dir)
-    model: str = config.get("model", DEFAULT_CONFIG["model"])
-
-    path_key = f"pageindex-cloud:{doc_id}"
-    synthetic_hash = hashlib.sha256(path_key.encode("utf-8")).hexdigest()
+    model = model or config.get("model", DEFAULT_CONFIG["model"])
+    synthetic_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     with kb_ingest_lock(kb_dir / ".openkb"):
-        registry = HashRegistry(openkb_dir / "hashes.json")
-        if registry.is_known(synthetic_hash):
-            click.echo(f"  [SKIP] Already imported from PageIndex Cloud: {doc_id}")
+        if HashRegistry(openkb_dir / "hashes.json").is_known(synthetic_hash):
+            click.echo(f"  [SKIP] Already imported: {key}")
             return "skipped"
 
-    click.echo(f"Importing from PageIndex Cloud: {doc_id}")
+    if isinstance(tree, list):
+        tree = {"doc_name": name, "doc_description": description, "structure": tree}
+    description = description or tree.get("doc_description", "")
+    all_pages = _normalize_page_content(pages)
+    if not all_pages:
+        click.echo(f"  [ERROR] Import failed: no page content for {key}")
+        return "failed"
+
+    click.echo(f"Importing prepared document: {name}")
     doc_name = ""
     from openkb.add_coordinator import AddMutationPlan, DirtyRollbackError, run_add_mutation
 
     try:
-        try:
-            cloud = prepare_cloud_import(doc_id, kb_dir, path_key)
-        except Exception as exc:
-            click.echo(f"  [ERROR] Import failed: {exc}")
-            logger.debug("Cloud import traceback:", exc_info=True)
-            return "failed"
-
         with kb_ingest_lock(kb_dir / ".openkb"):
             registry = HashRegistry(openkb_dir / "hashes.json")
             if registry.is_known(synthetic_hash):
-                click.echo(f"  [SKIP] Already imported from PageIndex Cloud: {doc_id}")
+                click.echo(f"  [SKIP] Already imported: {key}")
                 return "skipped"
 
-            stem = _cloud_display_stem(cloud.cloud_name, doc_id)
-            doc_name = resolve_doc_name_from_key(stem, path_key, registry)
+            doc_name = resolve_doc_name_from_key(Path(name).stem or key, key, registry)
 
             def commit_body(_snapshot) -> None:
                 summary_path = _write_long_doc_artifacts(
-                    cloud.tree,
-                    cloud.all_pages,
-                    doc_name,
-                    doc_id,
-                    kb_dir,
-                    description=cloud.description,
+                    tree, all_pages, doc_name, key, kb_dir, description=description
                 )
                 _run_compile_with_retry(
                     lambda: compile_long_doc(
                         doc_name,
                         summary_path,
-                        doc_id,
+                        key,
                         kb_dir,
                         model,
-                        doc_description=cloud.description,
+                        doc_description=description,
                         max_concurrency=resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY,
+                        bundle=bundle,
                     ),
-                    label=f"Compiling imported doc (doc_id={doc_id})",
+                    label=f"Compiling prepared doc ({key})",
                 )
 
-                # Register the raw-less cloud entry only after successful compilation.
+                # Register the raw-less entry only after successful compilation.
                 registry = HashRegistry(openkb_dir / "hashes.json")
                 meta = {
-                    "name": cloud.cloud_name,
+                    "name": name,
                     "doc_name": doc_name,
-                    "type": "pageindex_cloud",
-                    "origin": "cloud",
-                    "path": path_key,
+                    "type": "pageindex_prepared",
+                    "origin": "prepared",
+                    "path": key,
                     "source_path": _registry_path(
                         kb_dir / "wiki" / "sources" / f"{doc_name}.json", kb_dir
                     ),
-                    "doc_id": doc_id,
+                    "doc_id": key,
                 }
                 registry.remove_by_doc_name(doc_name)
                 registry.add(synthetic_hash, meta)
 
-            def append_cloud_log() -> None:
+            def append_import_log() -> None:
                 append_log(kb_dir / "wiki", "ingest", doc_name)
 
             plan = AddMutationPlan(
-                operation="cloud_import",
-                details={"doc_id": doc_id, "doc_name": doc_name},
+                operation="prepared_import",
+                details={"key": key, "doc_name": doc_name},
                 touched_paths=_snapshot_add_paths(kb_dir, doc_name, None, None),
                 body=commit_body,
-                post_commit_hooks=[append_cloud_log],
-                # Cloud import reads from PageIndex Cloud and writes no local blob,
-                # so .openkb/files is never touched — nothing to snapshot there.
+                post_commit_hooks=[append_import_log],
+                # No PageIndex document is created here, so .openkb/docs is never
+                # touched — nothing to snapshot there.
                 hardlink_dirs={
                     kb_dir / "wiki" / "concepts",
                     kb_dir / "wiki" / "entities",
@@ -810,13 +773,12 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> Literal["added", "
         raise
     except Exception as exc:
         # run_add_mutation handles snapshot/body failures itself (returns False),
-        # so this except only catches pre-mutation errors — surface the real cause
-        # instead of the old misleading "Failed to prepare mutation snapshot" label.
-        click.echo(f"  [ERROR] Cloud import failed for {doc_id}: {exc}")
-        logger.debug("Cloud import mutation traceback:", exc_info=True)
+        # so this only catches pre-mutation errors — surface the real cause.
+        click.echo(f"  [ERROR] Import failed for {key}: {exc}")
+        logging.getLogger(__name__).debug("Prepared import traceback:", exc_info=True)
         return "failed"
 
-    click.echo(f"  [OK] {doc_name} imported from PageIndex Cloud.")
+    click.echo(f"  [OK] {doc_name} imported.")
     return "added"
 
 
@@ -1064,17 +1026,9 @@ def init(model, language):
 
 @cli.command()
 @click.argument("path", required=False)
-@click.option(
-    "--from-pageindex-cloud",
-    "from_pageindex_cloud",
-    default=None,
-    metavar="DOC_ID",
-    help="Import an already-indexed PageIndex Cloud document by its doc-id "
-    "(no local file). Mutually exclusive with PATH.",
-)
 @click.pass_context
 @_with_kb_lock(exclusive=True)
-def add(ctx, path, from_pageindex_cloud):
+def add(ctx, path):
     """Add a document or directory of documents at PATH to the knowledge base.
 
     PATH may be a local file, a local directory (which is walked
@@ -1082,28 +1036,14 @@ def add(ctx, path, from_pageindex_cloud):
     fetched into ``raw/`` first: PDF responses (by Content-Type and
     magic-byte sniff) are saved as ``.pdf``; HTML responses are run
     through trafilatura's main-content extractor and saved as ``.md``.
-
-    Alternatively, pass --from-pageindex-cloud <DOC_ID> to import a document
-    that is already indexed in PageIndex Cloud, with no local file. Requires
-    the PAGEINDEX_API_KEY environment variable.
     """
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
 
-    # Cloud import path — mutually exclusive with a local/URL PATH.
-    if from_pageindex_cloud is not None:
-        if path is not None:
-            click.echo("Provide either PATH or --from-pageindex-cloud, not both.")
-            return
-        outcome = import_from_pageindex_cloud(from_pageindex_cloud, kb_dir)
-        if outcome == "failed":
-            ctx.exit(1)
-        return
-
     if path is None:
-        click.echo("Provide a PATH or use --from-pageindex-cloud <DOC_ID>.")
+        click.echo("Provide a PATH.")
         return
 
     # URL ingest: download into raw/ first, then call add_single_file explicitly.
@@ -1281,26 +1221,24 @@ def _cleanup_pageindex(
     """Drop a long-doc entry from PageIndex's local SQLite + remove its
     managed files. Returns ``(did_cleanup, message)``.
 
-    No-op (returns ``(False, "no PageIndex state")``) when no
-    ``pageindex.db`` exists — short-doc-only KBs never created any.
+    No-op (returns ``(False, "no PageIndex state")``) when no PageIndex
+    ``manifest.json`` exists — short-doc-only KBs never created any.
 
     Falls back to matching by ``doc_name`` via ``list_documents()`` when
     the registry entry pre-dates PR #51's ``doc_id`` field. Ambiguous
     multi-match cases are skipped with a warning rather than guessed.
     """
-    if not (openkb_dir / "pageindex.db").exists():
+    if not (openkb_dir / "manifest.json").exists():
         return False, "no PageIndex state"
 
     from pageindex import PageIndexClient
 
-    _setup_llm_key(kb_dir)
-    config = resolve_effective_config(kb_dir)[0]
-    model = config.get("model", DEFAULT_CONFIG.get("model", "gpt-5.4"))
-    client = PageIndexClient(model=model, storage_path=str(openkb_dir))
-    col = client.collection()
+    # Deleting from the local store calls no model, so no key is set up.
+    client = PageIndexClient(index={"mode": "local", "storage_path": str(openkb_dir)})
 
     if doc_id is None:
-        candidates = [d for d in col.list_documents() if d.get("doc_name") == doc_name]
+        listed = client.list_documents(limit=10000).get("documents", [])
+        candidates = [d for d in listed if d.get("name") in (doc_name, f"{doc_name}.pdf")]
         if not candidates:
             return False, "no PageIndex doc to delete"
         if len(candidates) > 1:
@@ -1308,9 +1246,9 @@ def _cleanup_pageindex(
                 f"{len(candidates)} PageIndex docs match doc_name='{doc_name}'; "
                 "skipping (re-add to refresh)"
             )
-        doc_id = candidates[0]["doc_id"]
+        doc_id = candidates[0]["id"]
 
-    col.delete_document(doc_id)
+    client.delete_document(doc_id)
     return True, f"deleted PageIndex doc ({doc_id[:12]}…)"
 
 
@@ -1466,12 +1404,12 @@ def _build_remove_plan(
 
     actions.append(RemoveAction("REGISTRY", f"remove hash entry  ({file_hash[:12]}…)"))
 
-    # Long PDFs leave state in PageIndex's local store (`.openkb/pageindex.db`
-    # row + `.openkb/files/<collection>/<doc_id>.pdf` + extracted images).
-    # Only flag this when both the registry says long_pdf and PageIndex
-    # state exists on disk — short-doc-only KBs never created any.
+    # Long PDFs leave state in PageIndex's local store (`.openkb/manifest.json`
+    # entry + `.openkb/docs/<doc_id>/`). Only flag this when both the registry
+    # says long_pdf and PageIndex state exists on disk — short-doc-only KBs
+    # never created any.
     pageindex_doc_id = meta.get("doc_id")
-    cleanup_pageindex = doc_type == "long_pdf" and (openkb_dir / "pageindex.db").exists()
+    cleanup_pageindex = doc_type == "long_pdf" and (openkb_dir / "manifest.json").exists()
     if cleanup_pageindex:
         if pageindex_doc_id:
             actions.append(RemoveAction("PAGEINDEX", f"delete document ({pageindex_doc_id[:12]}…)"))
@@ -3533,13 +3471,16 @@ def initialize_kb(
     model: str | None = None,
     api_key: str | None = None,
     openai_api_base: str | None = None,
+    inherit_env: bool = True,
 ) -> dict[str, Any]:
     """Initialize a knowledge base at an explicit directory (REST ``/init``).
 
     Non-interactive counterpart to the ``init`` Click command: creates the
     raw/wiki/.openkb layout, seed files, config, and empty hash registry, then
     optionally writes LLM credentials to a KB-local ``.env``. Raises
-    ``FileExistsError`` if the KB is already initialized.
+    ``FileExistsError`` if the KB is already initialized. ``inherit_env=False``
+    keeps the working directory's ``.env`` out of the KB — for a host that
+    passes credentials per call and must not copy its secrets to disk.
     """
     kb_dir = kb_dir.expanduser().resolve()
     openkb_dir = kb_dir / ".openkb"
@@ -3592,7 +3533,7 @@ def initialize_kb(
     if can_write_env:
         env_pairs["LITELLM_LOCAL_MODEL_COST_MAP"] = "true"
         template_env = Path.cwd() / ".env"
-        if template_env.exists():
+        if inherit_env and template_env.exists():
             for raw in template_env.read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
                 if not line or line.startswith("#") or "=" not in line:

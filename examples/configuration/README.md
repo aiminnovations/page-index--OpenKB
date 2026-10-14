@@ -110,7 +110,7 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 | --- | --- | --- |
 | `model` | `gpt-5.4` | LLM used for all compile/query/chat work. |
 | `language` | `en` | Language the wiki is written in. |
-| `pageindex_threshold` | `20` | PDFs with this many pages **or more** take the long-doc (PageIndex) path; shorter ones go through the short-doc path. See [`pageindex-cloud/`](../pageindex-cloud/). |
+| `pageindex_threshold` | `20` | PDFs with this many pages **or more** take the long-doc (PageIndex) path; shorter ones go through the short-doc path. |
 | `concurrency` | `null` | Caps concurrent LLM calls OpenKB makes during ingest — both PageIndex's indexing of a long document and OpenKB's own concept/entity compilation. The two never run at once for the same document, so one setting covers both. Lower it if you hit provider rate limits or "too many open files" on large PDFs. `null` lets each stage apply its own default. |
 | `parallel_tool_calls` | unset | Whether the LLM agents (query, chat, lint, skill) may call tools in parallel. Unset keeps OpenKB's per-agent defaults; `true`/`false` force allow/sequential for every agent; `null` omits the setting (provider default). **Amazon Bedrock needs `null`** (see below). |
 | `entity_types` | 7 defaults | Custom vocabulary for entity pages. `other` is always kept. |
@@ -193,8 +193,6 @@ LLM_API_KEY=your-key-here
   `LLM_API_KEY` is exported as `ANTHROPIC_API_KEY` automatically.
 - **OAuth providers** (`chatgpt/*`, `github_copilot/*`) need **no** key — OpenKB
   won't warn about a missing one.
-- **PageIndex Cloud** uses a separate `PAGEINDEX_API_KEY` (see
-  [`pageindex-cloud/`](../pageindex-cloud/)).
 - **Amazon Bedrock** (`model: bedrock/...`) authenticates with AWS credentials,
   not `LLM_API_KEY`. Put them in `<kb>/.env` (LiteLLM/boto3 read them from the
   environment); `LLM_API_KEY` isn't needed:

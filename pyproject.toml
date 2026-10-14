@@ -31,14 +31,18 @@ keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "age
 # litellm 1.87.2 fixes the chatgpt/* (ChatGPT subscription) provider
 # returning empty Responses output (BerriAI/litellm#25429) and
 # auto-injects GitHub Copilot IDE-auth headers.
+# pageindex 0.4.0 (client API: submit_document/get_tree/...; IndexConfig is a
+# TypedDict) requires litellm>=1.105 and openai-agents>=0.18.1, which set those
+# two; openai stays at 2.44.0. click is a floor so a host that already ships a
+# newer click (e.g. Librarian) is not downgraded.
 dependencies = [
-    "pageindex==0.3.0.dev3",
+    "pageindex==0.4.0",
     "markitdown[docx,pptx,xlsx,xls]==0.1.5",
     "trafilatura==2.0.0",
-    "click==8.4.0",
+    "click>=8.4.0",
     "watchdog==6.0.0",
-    "litellm==1.87.2",
-    "openai-agents==0.17.3",
+    "litellm==1.105.1",
+    "openai-agents>=0.18.1",
     # openai 2.45.0 added a required `cache_write_tokens` field to
     # InputTokensDetails that openai-agents 0.17.3 does not set, crashing
     # usage parsing on every response (issue #187). Pin below 2.45 until
@@ -83,6 +87,9 @@ api = ["openkb[web]"]
 
 [tool.hatch.version]
 source = "vcs"
+# A commit tarball (e.g. a pinned `openkb @ .../archive/<sha>.tar.gz` install)
+# carries no git metadata; build it as the fork's release line instead of failing.
+fallback-version = "0.5.0rc1+aim"
 
 # The Workbench web bundle (openkb/web) is git-ignored but must ship in the
 # published package. `artifacts` force-includes it into both the sdist and the

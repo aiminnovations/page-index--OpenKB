@@ -163,23 +163,23 @@ class TestAddCommand:
         )
 
     def test_long_doc_rollback_removes_only_the_new_blob(self, tmp_path):
-        """A failed long-doc add must roll back the blob IT created under
-        .openkb/files, while a pre-existing blob (another document) survives —
-        the targeted track_new must not touch blobs this add didn't create."""
+        """A failed long-doc add must roll back the PageIndex document IT
+        created under .openkb/docs, while a pre-existing document survives —
+        the targeted track_new must not touch documents this add didn't create."""
         from openkb.cli import add_single_file
         from openkb.indexer import IndexResult
 
         kb_dir = self._setup_kb(tmp_path)
-        files = kb_dir / ".openkb" / "files" / "default"
-        files.mkdir(parents=True)
-        other = files / "other-doc.pdf"
+        files = kb_dir / ".openkb" / "docs"
+        (files / "other-doc").mkdir(parents=True)
+        other = files / "other-doc" / "meta.json"
         other.write_bytes(b"another-doc-keep-me")
 
         new_id = "11111111-1111-1111-1111-111111111111"
 
         def fake_index(raw_path, kb_dir_arg, doc_name=None):
-            (files / f"{new_id}.pdf").write_bytes(b"new-blob")
             (files / new_id / "images").mkdir(parents=True)
+            (files / new_id / "meta.json").write_bytes(b"new-doc")
             (files / new_id / "images" / "p1.png").write_bytes(b"img")
             return IndexResult(doc_id=new_id, description="", tree={"structure": []})
 
@@ -197,23 +197,21 @@ class TestAddCommand:
             outcome = add_single_file(doc, kb_dir)
 
         assert outcome == "failed"
-        assert not (files / f"{new_id}.pdf").exists()  # new blob rolled back
-        assert not (files / new_id).exists()  # new images subtree rolled back
+        assert not (files / new_id).exists()  # the new document rolled back
         assert other.read_bytes() == b"another-doc-keep-me"  # pre-existing survives
 
     def test_long_doc_dedup_hit_does_not_delete_existing_blob(self, tmp_path):
-        """PageIndex content-dedup can return an EXISTING doc_id and write no new
-        blob (diverged hashes.json/pageindex.db). A failed add must NOT delete
-        that pre-existing blob on rollback (regression: track_new globbing the
-        doc_id would otherwise register and delete it)."""
+        """An index step that returns an EXISTING doc_id and writes no new
+        document (diverged hashes.json/manifest). A failed add must NOT delete
+        that pre-existing document on rollback."""
         from openkb.cli import add_single_file
         from openkb.indexer import IndexResult
 
         kb_dir = self._setup_kb(tmp_path)
-        files = kb_dir / ".openkb" / "files" / "default"
-        files.mkdir(parents=True)
+        files = kb_dir / ".openkb" / "docs"
         existing_id = "22222222-2222-2222-2222-222222222222"
-        existing_blob = files / f"{existing_id}.pdf"
+        (files / existing_id).mkdir(parents=True)
+        existing_blob = files / existing_id / "meta.json"
         existing_blob.write_bytes(b"pre-existing-do-not-delete")
 
         def fake_index_dedup(raw_path, kb_dir_arg, doc_name=None):
@@ -412,43 +410,7 @@ class TestAddCommand:
         assert len(new_entries) == 1  # …exactly one entry survives
         assert new_entries[0]["path"]  # with path identity persisted
 
-    def test_add_from_pageindex_cloud_dispatches(self, tmp_path):
-        kb_dir = self._setup_kb(tmp_path)
-        runner = CliRunner()
-        with (
-            patch("openkb.cli.import_from_pageindex_cloud", return_value="added") as mock_imp,
-            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
-        ):
-            result = runner.invoke(cli, ["add", "--from-pageindex-cloud", "doc-123"])
-            mock_imp.assert_called_once_with("doc-123", kb_dir)
-            assert result.exit_code == 0  # success → exit 0
-
-    def test_add_cloud_failure_exits_nonzero(self, tmp_path):
-        kb_dir = self._setup_kb(tmp_path)
-        runner = CliRunner()
-        with (
-            patch("openkb.cli.import_from_pageindex_cloud", return_value="failed"),
-            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
-        ):
-            result = runner.invoke(cli, ["add", "--from-pageindex-cloud", "doc-x"])
-            assert result.exit_code == 1  # failed import must not exit 0
-
-    def test_add_rejects_path_and_cloud_together(self, tmp_path):
-        kb_dir = self._setup_kb(tmp_path)
-        doc = tmp_path / "test.md"
-        doc.write_text("# Hi")
-        runner = CliRunner()
-        with (
-            patch("openkb.cli.import_from_pageindex_cloud") as mock_imp,
-            patch("openkb.cli.add_single_file") as mock_add,
-            patch("openkb.cli._find_kb_dir", return_value=kb_dir),
-        ):
-            result = runner.invoke(cli, ["add", str(doc), "--from-pageindex-cloud", "doc-1"])
-            assert "not both" in result.output
-            mock_imp.assert_not_called()
-            mock_add.assert_not_called()
-
-    def test_add_requires_path_or_cloud(self, tmp_path):
+    def test_add_requires_path(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
         runner = CliRunner()
         with patch("openkb.cli._find_kb_dir", return_value=kb_dir):
@@ -456,7 +418,9 @@ class TestAddCommand:
             assert "Provide a PATH" in result.output
 
 
-class TestImportFromPageindexCloud:
+class TestImportPrepared:
+    """import_prepared: a tree + pages indexed elsewhere, under the caller's key."""
+
     def _setup_kb(self, tmp_path):
         (tmp_path / "raw").mkdir()
         (tmp_path / "wiki" / "sources" / "images").mkdir(parents=True)
@@ -470,104 +434,88 @@ class TestImportFromPageindexCloud:
         return tmp_path
 
     def _cloud_data(self, doc_name="Cloud-Paper"):
-        from openkb.indexer import CloudImportData
-
-        return CloudImportData(
-            doc_id="cloud-1",
-            doc_name=doc_name,
-            cloud_name="Cloud Paper.pdf",
-            description="desc",
-            tree={
-                "doc_name": "Cloud Paper.pdf",
-                "doc_description": "desc",
-                "structure": [],
-            },
-            all_pages=[{"page": 1, "content": "Cloud page", "images": []}],
-        )
+        return {
+            "key": "lib:w1",
+            "name": doc_name,
+            "description": "desc",
+            "tree": {"doc_name": doc_name, "doc_description": "desc", "structure": []},
+            "pages": [{"page": 1, "content": "Cloud page", "images": []}],
+        }
 
     def test_registers_rawless_cloud_entry(self, tmp_path):
         import hashlib
 
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.state import HashRegistry
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data()
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.cli.compile_long_doc", return_value=None) as mock_compile,
-            patch("openkb.cli._setup_llm_key"),
         ):
-            outcome = import_from_pageindex_cloud("cloud-1", kb_dir)
+            outcome = import_prepared(kb_dir, **cloud)
 
         assert outcome == "added"
         mock_compile.assert_called_once()
+        assert mock_compile.call_args.args[2] == "lib:w1"  # the key stands in for a doc_id
         registry = HashRegistry(kb_dir / ".openkb" / "hashes.json")
-        synthetic = hashlib.sha256(b"pageindex-cloud:cloud-1").hexdigest()
+        synthetic = hashlib.sha256(b"lib:w1").hexdigest()
         meta = registry.get(synthetic)
         assert meta is not None
-        assert meta["type"] == "pageindex_cloud"
-        assert meta["origin"] == "cloud"
-        assert meta["doc_id"] == "cloud-1"
-        assert meta["path"] == "pageindex-cloud:cloud-1"
+        assert meta["type"] == "pageindex_prepared"
+        assert meta["origin"] == "prepared"
+        assert meta["doc_id"] == "lib:w1"
+        assert meta["path"] == "lib:w1"
         assert "raw_path" not in meta
 
     def test_second_import_is_skipped(self, tmp_path):
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data()
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud) as mock_prepare,
             patch("openkb.cli.compile_long_doc", return_value=None),
-            patch("openkb.cli._setup_llm_key"),
         ):
-            import_from_pageindex_cloud("cloud-1", kb_dir)
-            second = import_from_pageindex_cloud("cloud-1", kb_dir)
+            import_prepared(kb_dir, **cloud)
+            second = import_prepared(kb_dir, **cloud)
 
         assert second == "skipped"
-        assert mock_prepare.call_count == 1  # not fetched again
 
     def test_import_failure_returns_failed_and_registers_nothing(self, tmp_path):
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.state import HashRegistry
 
         kb_dir = self._setup_kb(tmp_path)
-        with (
-            patch("openkb.cli.prepare_cloud_import", side_effect=RuntimeError("boom")),
-            patch("openkb.cli._setup_llm_key"),
-        ):
-            outcome = import_from_pageindex_cloud("cloud-9", kb_dir)
+        cloud = {**self._cloud_data(), "pages": []}  # nothing usable to import
+        outcome = import_prepared(kb_dir, **cloud)
 
         assert outcome == "failed"
         registry = HashRegistry(kb_dir / ".openkb" / "hashes.json")
         assert registry.all_entries() == {}
 
-    def test_cloud_import_uses_add_mutation_coordinator(self, tmp_path):
-        from openkb.cli import import_from_pageindex_cloud
+    def test_prepared_import_uses_add_mutation_coordinator(self, tmp_path):
+        from openkb.cli import import_prepared
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.add_coordinator.run_add_mutation", return_value=True) as mock_run,
-            patch("openkb.cli._setup_llm_key"),
         ):
-            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "added"
+            assert import_prepared(kb_dir, **cloud) == "added"
 
         plan = mock_run.call_args.args[1]
-        assert plan.operation == "cloud_import"
-        assert plan.details == {"doc_id": "cloud-1", "doc_name": "Cloud-Paper"}
+        assert plan.operation == "prepared_import"
+        assert plan.details == {"key": "lib:w1", "doc_name": "Cloud-Paper"}
         assert kb_dir / ".openkb" / "hashes.json" in plan.touched_paths
 
-    def test_cloud_import_rechecks_doc_name_under_lock_after_prepare_race(self, tmp_path):
+    def test_prepared_import_rechecks_doc_name_under_lock_after_prepare_race(self, tmp_path):
         import hashlib
         from contextlib import contextmanager
 
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.locks import kb_ingest_lock as real_kb_ingest_lock
         from openkb.state import HashRegistry
 
@@ -597,31 +545,29 @@ class TestImportFromPageindexCloud:
                 yield
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.cli.kb_ingest_lock", side_effect=race_before_lock),
             patch("openkb.cli.compile_long_doc", return_value=None),
-            patch("openkb.cli._setup_llm_key"),
         ):
-            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "added"
+            assert import_prepared(kb_dir, **cloud) == "added"
 
         registry = HashRegistry(kb_dir / ".openkb" / "hashes.json")
-        synthetic = hashlib.sha256(b"pageindex-cloud:cloud-1").hexdigest()
+        synthetic = hashlib.sha256(b"lib:w1").hexdigest()
         expected_doc_name = f"Cloud-Paper-{synthetic[:8]}"
         assert registry.get(existing_hash)["doc_name"] == "Cloud-Paper"
         assert registry.get(synthetic)["doc_name"] == expected_doc_name
         assert (kb_dir / "wiki" / "sources" / f"{expected_doc_name}.json").exists()
 
-    def test_cloud_import_skips_if_same_doc_id_registered_after_fetch(self, tmp_path):
+    def test_prepared_import_skips_if_same_doc_id_registered_after_fetch(self, tmp_path):
         import hashlib
         from contextlib import contextmanager
 
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.locks import kb_ingest_lock as real_kb_ingest_lock
         from openkb.state import HashRegistry
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
-        path_key = "pageindex-cloud:cloud-1"
+        path_key = "lib:w1"
         synthetic = hashlib.sha256(path_key.encode("utf-8")).hexdigest()
         lock_calls = {"count": 0}
 
@@ -645,72 +591,65 @@ class TestImportFromPageindexCloud:
                 yield
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud) as mock_prepare,
             patch("openkb.cli.kb_ingest_lock", side_effect=register_same_doc_before_second_lock),
             patch("openkb.cli.compile_long_doc") as mock_compile,
             patch("openkb.add_coordinator.run_add_mutation") as mock_run,
-            patch("openkb.cli._setup_llm_key"),
         ):
-            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "skipped"
+            assert import_prepared(kb_dir, **cloud) == "skipped"
 
         assert lock_calls["count"] == 2
-        mock_prepare.assert_called_once()
         mock_compile.assert_not_called()
         mock_run.assert_not_called()
         assert HashRegistry(kb_dir / ".openkb" / "hashes.json").is_known(synthetic)
 
-    def test_cloud_import_propagates_dirty_rollback(self, tmp_path):
+    def test_prepared_import_propagates_dirty_rollback(self, tmp_path):
         import pytest
 
         from openkb.add_coordinator import DirtyRollbackError
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
         dirty_error = DirtyRollbackError(
-            "cloud_import",
+            "prepared_import",
             kb_dir / ".openkb" / "journal" / "retained.json",
         )
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.add_coordinator.run_add_mutation", side_effect=dirty_error),
-            patch("openkb.cli._setup_llm_key"),
         ):
             with pytest.raises(DirtyRollbackError) as exc_info:
-                import_from_pageindex_cloud("cloud-1", kb_dir)
+                import_prepared(kb_dir, **cloud)
 
         assert exc_info.value is dirty_error
 
-    def test_cloud_import_failure_message_names_real_cause(self, tmp_path, capsys):
+    def test_prepared_import_failure_message_names_real_cause(self, tmp_path, capsys):
         """A non-body failure caught at the outer except (here: name resolution)
         must surface the real error, not be mislabeled as 'Failed to prepare
         mutation snapshot'. run_add_mutation handles snapshot/body failures
         itself and returns False, so the broad except only ever catches
         pre-mutation errors that the old label misdescribed."""
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
 
         kb_dir = self._setup_kb(tmp_path)
         cloud = self._cloud_data(doc_name="Cloud-Paper")
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch(
                 "openkb.cli.resolve_doc_name_from_key",
                 side_effect=RuntimeError("name resolution blew up"),
             ),
-            patch("openkb.cli._setup_llm_key"),
         ):
-            assert import_from_pageindex_cloud("cloud-1", kb_dir) == "failed"
+            assert import_prepared(kb_dir, **cloud) == "failed"
 
         out = capsys.readouterr().out
         assert "Failed to prepare mutation snapshot" not in out
         assert "name resolution blew up" in out
 
-    def test_cloud_import_keyboard_interrupt_rolls_back_artifacts(self, tmp_path):
+    def test_prepared_import_keyboard_interrupt_rolls_back_artifacts(self, tmp_path):
         import pytest
 
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.state import HashRegistry
 
         kb_dir = self._setup_kb(tmp_path)
@@ -718,12 +657,10 @@ class TestImportFromPageindexCloud:
         cloud = self._cloud_data(doc_name=doc_name)
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.cli.compile_long_doc", side_effect=KeyboardInterrupt()),
-            patch("openkb.cli._setup_llm_key"),
         ):
             with pytest.raises(KeyboardInterrupt):
-                import_from_pageindex_cloud("cloud-1", kb_dir)
+                import_prepared(kb_dir, **cloud)
 
         assert not (kb_dir / "wiki" / "summaries" / f"{doc_name}.md").exists()
         assert not (kb_dir / "wiki" / "sources" / f"{doc_name}.json").exists()
@@ -735,7 +672,7 @@ class TestImportFromPageindexCloud:
         summary/source artifacts are cleaned up — no registry entry exists, so
         `openkb remove` couldn't reach them otherwise — and nothing is registered
         (so a retry isn't skipped)."""
-        from openkb.cli import import_from_pageindex_cloud
+        from openkb.cli import import_prepared
         from openkb.state import HashRegistry
 
         kb_dir = self._setup_kb(tmp_path)
@@ -745,12 +682,10 @@ class TestImportFromPageindexCloud:
         cloud = self._cloud_data(doc_name=doc_name)
 
         with (
-            patch("openkb.cli.prepare_cloud_import", return_value=cloud),
             patch("openkb.cli.compile_long_doc", side_effect=RuntimeError("boom")),
             patch("openkb.cli.time.sleep"),
-            patch("openkb.cli._setup_llm_key"),
         ):
-            outcome = import_from_pageindex_cloud("cloud-1", kb_dir)
+            outcome = import_prepared(kb_dir, **cloud)
 
         assert outcome == "failed"
         # Orphan artifacts cleaned up (would be unreachable by `remove` otherwise).
@@ -758,6 +693,44 @@ class TestImportFromPageindexCloud:
         assert not (kb_dir / "wiki" / "sources" / f"{doc_name}.json").exists()
         # Nothing registered → a retry is not skipped.
         assert HashRegistry(kb_dir / ".openkb" / "hashes.json").all_entries() == {}
+
+    def test_bundle_and_model_reach_compile_and_nothing_is_set_process_wide(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+
+        import litellm
+
+        from openkb.cli import import_prepared
+        from openkb.config import LlmCredentialBundle
+
+        kb_dir = self._setup_kb(tmp_path)
+        cloud = self._cloud_data()
+        bundle = LlmCredentialBundle(
+            api_key="sk-x", base_url="http://gateway:8787/v1",
+            extra_headers={"x-portkey-provider": "anthropic"}, max_tokens=8192,
+        )
+        for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_API_KEY"):
+            monkeypatch.delenv(k, raising=False)
+        before = litellm.api_key
+        with patch("openkb.cli.compile_long_doc", return_value=None) as mock_compile:
+            assert import_prepared(kb_dir, **cloud, model="openai/m", bundle=bundle) == "added"
+
+        assert mock_compile.call_args.args[4] == "openai/m"
+        assert mock_compile.call_args.kwargs["bundle"] is bundle
+        assert litellm.api_key == before
+        assert not any(os.environ.get(k) for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_API_KEY"))
+
+    def test_bare_structure_list_is_wrapped_into_a_tree(self, tmp_path):
+        from openkb.cli import import_prepared
+
+        kb_dir = self._setup_kb(tmp_path)
+        cloud = {**self._cloud_data(), "tree": [{"title": "Ch 1", "node_id": "0", "start_index": 1,
+                                                 "end_index": 1, "summary": "s"}]}
+        with patch("openkb.cli.compile_long_doc", return_value=None):
+            assert import_prepared(kb_dir, **cloud) == "added"
+        summary = (kb_dir / "wiki" / "summaries" / "Cloud-Paper.md").read_text(encoding="utf-8")
+        assert "Ch 1 (pages 1–1)" in summary
 
 
 class TestAddMutationCoordinator:

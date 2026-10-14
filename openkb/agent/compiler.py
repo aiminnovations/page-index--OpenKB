@@ -417,6 +417,8 @@ def _llm_call(
     if bundle is not None:
         kwargs.setdefault("api_key", bundle.api_key)
         kwargs.setdefault("base_url", bundle.base_url)
+        if bundle.max_tokens:
+            kwargs.setdefault("max_tokens", bundle.max_tokens)
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
     if kwargs:
         logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
@@ -460,6 +462,8 @@ async def _llm_call_async(
     if bundle is not None:
         kwargs.setdefault("api_key", bundle.api_key)
         kwargs.setdefault("base_url", bundle.base_url)
+        if bundle.max_tokens:
+            kwargs.setdefault("max_tokens", bundle.max_tokens)
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
     if kwargs:
         logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
